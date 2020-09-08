@@ -1,167 +1,270 @@
 //! A Rust client for the NATS.io ecosystem.
 //!
-//! <code>git clone https://github.com/nats-io/nats.rs</code>
+//! `git clone https://github.com/nats-io/nats.rs`
 //!
-//! NATS.io is a simple, secure and high performance open source messaging system for cloud native applications,
-//! IoT messaging, and microservices architectures.
+//! NATS.io is a simple, secure and high performance open source messaging system for cloud native
+//! applications, `IoT` messaging, and microservices architectures.
 //!
 //! For more information see [https://nats.io/].
 //!
 //! [https://nats.io/]: https://nats.io/
 //!
-use std::collections::{HashMap, VecDeque};
-use std::io::{self, BufReader, BufWriter, Error, ErrorKind, Write};
-use std::net::{Shutdown, SocketAddr, TcpStream};
-use std::sync::atomic::{AtomicUsize, Ordering};
-use std::sync::{Arc, Mutex, RwLock};
-use std::time::Duration;
-use std::{fmt, str, thread};
+//! ## Examples
+//!
+//! `> cargo run --example nats-box -- -h`
+//!
+//! Basic connections, and those with options. The compiler will force these to be correct.
+//!
+//! ```no_run
+//! # fn main() -> Result<(), Box<dyn std::error::Error>> {
+//! let nc = nats::connect("demo.nats.io")?;
+//!
+//! let nc2 = nats::Options::with_user_pass("derek", "s3cr3t!")
+//!     .with_name("My Rust NATS App")
+//!     .connect("127.0.0.1")?;
+//!
+//! let nc3 = nats::Options::with_credentials("path/to/my.creds")
+//!     .connect("connect.ngs.global")?;
+//!
+//! let nc4 = nats::Options::new()
+//!     .add_root_certificate("my-certs.pem")
+//!     .connect("tls://demo.nats.io:4443")?;
+//! # Ok(()) }
+//! ```
+//!
+//! ### Publish
+//!
+//! ```
+//! # fn main() -> std::io::Result<()> {
+//! let nc = nats::connect("demo.nats.io")?;
+//! nc.publish("my.subject", "Hello World!")?;
+//!
+//! nc.publish("my.subject", "my message")?;
+//!
+//! // Publish a request manually.
+//! let reply = nc.new_inbox();
+//! let rsub = nc.subscribe(&reply)?;
+//! nc.publish_request("my.subject", &reply, "Help me!")?;
+//! # Ok(()) }
+//! ```
+//!
+//! ### Subscribe
+//!
+//! ```no_run
+//! # fn main() -> std::io::Result<()> {
+//! # use std::time::Duration;
+//! let nc = nats::connect("demo.nats.io")?;
+//! let sub = nc.subscribe("foo")?;
+//! for msg in sub.messages() {}
+//!
+//! // Using next.
+//! if let Some(msg) = sub.next() {}
+//!
+//! // Other iterators.
+//! for msg in sub.try_iter() {}
+//! for msg in sub.timeout_iter(Duration::from_secs(10)) {}
+//!
+//! // Using a threaded handler.
+//! let sub = nc.subscribe("bar")?.with_handler(move |msg| {
+//!     println!("Received {}", &msg);
+//!     Ok(())
+//! });
+//!
+//! // Queue subscription.
+//! let qsub = nc.queue_subscribe("foo", "my_group")?;
+//! # Ok(()) }
+//! ```
+//!
+//! ### Request/Response
+//!
+//! ```no_run
+//! # use std::time::Duration;
+//! # fn main() -> std::io::Result<()> {
+//! let nc = nats::connect("demo.nats.io")?;
+//! let resp = nc.request("foo", "Help me?")?;
+//!
+//! // With a timeout.
+//! let resp = nc.request_timeout("foo", "Help me?", Duration::from_secs(2))?;
+//!
+//! // With multiple responses.
+//! for msg in nc.request_multi("foo", "Help")?.iter() {}
+//!
+//! // Publish a request manually.
+//! let reply = nc.new_inbox();
+//! let rsub = nc.subscribe(&reply)?;
+//! nc.publish_request("foo", &reply, "Help me!")?;
+//! let response = rsub.iter().take(1);
+//! # Ok(()) }
+//! ```
 
-use crossbeam_channel::{Receiver, RecvTimeoutError, Sender};
-use serde::{Deserialize, Serialize};
+#![recursion_limit = "1024"]
+#![cfg_attr(test, deny(warnings))]
+#![deny(
+    missing_docs,
+    future_incompatible,
+    nonstandard_style,
+    rust_2018_idioms,
+    missing_copy_implementations,
+    trivial_casts,
+    trivial_numeric_casts,
+    unsafe_code,
+    unused_qualifications
+)]
+#![deny(
+    // over time, consider enabling the following commented-out lints:
+    // clippy::else_if_without_else,
+    // clippy::indexing_slicing,
+    // clippy::multiple_crate_versions,
+    // clippy::missing_const_for_fn,
+    clippy::cast_lossless,
+    clippy::cast_possible_truncation,
+    clippy::cast_possible_wrap,
+    clippy::cast_precision_loss,
+    clippy::cast_sign_loss,
+    clippy::checked_conversions,
+    clippy::decimal_literal_representation,
+    clippy::doc_markdown,
+    clippy::empty_enum,
+    clippy::explicit_into_iter_loop,
+    clippy::explicit_iter_loop,
+    clippy::expl_impl_clone_on_copy,
+    clippy::fallible_impl_from,
+    clippy::filter_map,
+    clippy::filter_map_next,
+    clippy::find_map,
+    clippy::float_arithmetic,
+    clippy::get_unwrap,
+    clippy::if_not_else,
+    clippy::inline_always,
+    clippy::invalid_upcast_comparisons,
+    clippy::items_after_statements,
+    clippy::map_flatten,
+    clippy::map_unwrap_or,
+    clippy::match_same_arms,
+    clippy::maybe_infinite_iter,
+    clippy::mem_forget,
+    clippy::module_name_repetitions,
+    clippy::multiple_inherent_impl,
+    clippy::needless_borrow,
+    clippy::needless_continue,
+    clippy::needless_pass_by_value,
+    clippy::non_ascii_literal,
+    clippy::path_buf_push_overwrite,
+    clippy::print_stdout,
+    clippy::pub_enum_variant_names,
+    clippy::redundant_closure_for_method_calls,
+    clippy::shadow_reuse,
+    clippy::shadow_same,
+    clippy::shadow_unrelated,
+    clippy::single_match_else,
+    clippy::string_add,
+    clippy::string_add_assign,
+    clippy::type_repetition_in_bounds,
+    clippy::unicode_not_nfc,
+    clippy::unimplemented,
+    clippy::unseparated_literal_suffix,
+    clippy::wildcard_dependencies,
+    clippy::wildcard_enum_match_arm,
+    clippy::wrong_pub_self_convention,
+)]
 
-mod parser;
+use smol::{future, prelude::*, Timer};
 
-#[deny(unsafe_code)]
+use crate::asynk::client::Client;
 
-const VERSION: &str = "0.0.1";
+pub mod asynk;
+mod connect;
+mod creds_utils;
+mod headers;
+mod options;
+mod secure_wipe;
+
+#[cfg(feature = "fault_injection")]
+mod fault_injection;
+
+#[cfg(feature = "fault_injection")]
+use fault_injection::{inject_delay, inject_io_failure};
+
+#[cfg(not(feature = "fault_injection"))]
+async fn inject_delay() {}
+
+#[cfg(not(feature = "fault_injection"))]
+fn inject_io_failure() -> io::Result<()> {
+    Ok(())
+}
+
+/// Functionality relating to subscribing to a
+/// subject.
+pub mod subscription;
+
+#[doc(hidden)]
+#[deprecated(since = "0.6.0", note = "this has been renamed to `Options`.")]
+pub type ConnectionOptions = Options;
+
+use std::{
+    fmt,
+    io::{self, Error, ErrorKind},
+    sync::Arc,
+    time::Duration,
+};
+
+use serde::Deserialize;
+
+pub use {headers::Headers, options::Options, subscription::Subscription};
+
+#[doc(hidden)]
+pub use connect::ConnectInfo;
+
+use secure_wipe::{SecureString, SecureVec};
+
+const VERSION: &str = env!("CARGO_PKG_VERSION");
 const LANG: &str = "rust";
 
-#[doc(hidden)]
-pub trait ConnectionState: private::Sealed {}
-mod private {
-    pub trait Sealed {}
-    impl Sealed for super::NotConnected {}
-    impl Sealed for super::Authenticated {}
-    impl Sealed for super::Connected {}
-    impl Sealed for dyn super::OptionState {}
+/// Information sent by the server back to this client
+/// during initial connection, and possibly again later.
+#[derive(Deserialize, Debug, Clone)]
+struct ServerInfo {
+    /// The unique identifier of the NATS server.
+    pub server_id: String,
+    /// Generated Server Name.
+    #[serde(default)]
+    pub server_name: String,
+    /// The host specified in the cluster parameter/options.
+    pub host: String,
+    /// The port number specified in the cluster parameter/options.
+    pub port: i16,
+    /// The version of the NATS server.
+    pub version: String,
+    /// If this is set, then the server should try to authenticate upon connect.
+    #[serde(default)]
+    pub auth_required: bool,
+    /// If this is set, then the server must authenticate using TLS.
+    #[serde(default)]
+    pub tls_required: bool,
+    /// Maximum payload size that the server will accept.
+    pub max_payload: i32,
+    /// The protocol version in use.
+    pub proto: i8,
+    /// The server-assigned client ID. This may change during reconnection.
+    pub client_id: u64,
+    /// The version of golang the NATS server was built with.
+    pub go: String,
+    #[serde(default)]
+    /// The nonce used for nkeys.
+    pub nonce: String,
+    /// A list of server urls that a client can connect to.
+    #[serde(default)]
+    pub connect_urls: Vec<String>,
+    /// The client IP as known by the server.
+    #[serde(default)]
+    pub client_ip: String,
 }
 
-impl ConnectionState for NotConnected {}
-impl ConnectionState for Authenticated {}
-impl ConnectionState for Connected {}
+use options::AuthStyle;
 
-#[derive(Debug)]
-pub struct Connection<S: ConnectionState> {
-    options: Options,
-    state: S,
-}
-
-#[doc(hidden)]
-pub trait OptionState {}
-impl OptionState for NotConnected {}
-impl OptionState for Authenticated {}
-
-// General Options
-impl<S> Connection<S>
-where
-    S: OptionState + ConnectionState,
-{
-    /// Add a name option for the unconnected connection.
-    ///
-    /// # Example
-    /// ```
-    /// # fn main() -> std::io::Result<()> {
-    /// let nc = nats::Connection::new()
-    ///     .with_name("My App")
-    ///     .connect("demo.nats.io")?;
-    /// # Ok(())
-    /// # }
-    /// ```
-    pub fn with_name(mut self, name: &str) -> Self {
-        self.options.name = Some(name.to_string());
-        self
-    }
-
-    /// Select option to not deliver messages that we have published.
-    ///
-    /// # Example
-    /// ```
-    /// # fn main() -> std::io::Result<()> {
-    /// let nc = nats::Connection::new()
-    ///     .no_echo()
-    ///     .connect("demo.nats.io")?;
-    /// # Ok(())
-    /// # }
-    /// ```
-    pub fn no_echo(mut self) -> Self {
-        self.options.no_echo = true;
-        self
-    }
-}
-
-#[derive(Debug, PartialEq)]
-pub enum ConnectionStatus {
-    Connecting,
-    Connected,
-    Closed,
-    Disconnected,
-    Reconnecting,
-}
-
-#[derive(Debug)]
-pub(crate) struct Outbound {
-    writer: BufWriter<TcpStream>,
-    flusher: Option<thread::JoinHandle<()>>,
-    should_flush: bool,
-    in_flush: bool,
-    closed: bool,
-}
-
-impl Outbound {
-    #[inline(always)]
-    fn write_response(&mut self, subj: &str, msgb: &[u8]) -> io::Result<()> {
-        write!(self.writer, "PUB {} {}\r\n", subj, msgb.len())?;
-        self.writer.write(msgb)?;
-        self.writer.write(b"\r\n")?;
-        if self.should_flush && !self.in_flush {
-            self.kick_flusher();
-        }
-        Ok(())
-    }
-
-    #[inline(always)]
-    fn kick_flusher(&self) {
-        if let Some(flusher) = &self.flusher {
-            flusher.thread().unpark();
-        }
-    }
-}
-
-#[doc(hidden)]
-pub struct NotConnected;
-#[doc(hidden)]
-pub struct Authenticated;
-
-#[derive(Debug)]
-#[doc(hidden)]
-pub struct Connected {
-    id: String,
-    status: ConnectionStatus,
-    stream: TcpStream,
-    info: ServerInfo,
-    sid: AtomicUsize,
-    subs: Arc<RwLock<HashMap<usize, Sender<Message>>>>,
-    pongs: Arc<Mutex<VecDeque<Sender<bool>>>>,
-    writer: Arc<Mutex<Outbound>>,
-    reader: Option<thread::JoinHandle<()>>,
-}
-
-#[derive(Serialize, Clone, Debug)]
-enum AuthStyle {
-    //    Credentials(String, String),
-    Token(String),
-    UserPass(String, String),
-    None,
-}
-
-#[derive(Clone, Debug)]
-#[doc(hidden)]
-pub struct Options {
-    auth: AuthStyle,
-    name: Option<String>,
-    no_echo: bool,
-}
+/// A NATS connection.
+#[derive(Debug, Clone)]
+pub struct Connection(asynk::Connection);
 
 /// Connect to a NATS server at the given url.
 ///
@@ -172,242 +275,64 @@ pub struct Options {
 /// # Ok(())
 /// # }
 /// ```
-pub fn connect(nats_url: &str) -> io::Result<Connection<Connected>> {
-    Connection::new().connect(nats_url)
+pub fn connect(nats_url: &str) -> io::Result<Connection> {
+    Options::new().connect(nats_url)
 }
 
-impl Connection<NotConnected> {
-    /// Create a new NATS connection. This will not be a connected connection.
-    ///
-    /// # Example
-    /// ```
-    /// # fn main() -> std::io::Result<()> {
-    /// let nc = nats::Connection::new().connect("demo.nats.io")?;
-    /// # Ok(())
-    /// # }
-    /// ```
-    pub fn new() -> Connection<NotConnected> {
-        Connection {
-            state: NotConnected {},
-            options: Options {
-                auth: AuthStyle::None,
-                name: None,
-                no_echo: false,
-            },
-        }
-    }
-
-    /// Authenticate this NATS connection with a token.
-    ///
-    /// # Example
-    /// ```
-    /// # fn main() -> std::io::Result<()> {
-    /// let nc = nats::Connection::new()
-    ///     .with_token("t0k3n!")
-    ///     .connect("demo.nats.io")?;
-    /// # Ok(())
-    /// # }
-    /// ```
-    pub fn with_token(self, token: &str) -> Connection<Authenticated> {
-        let mut opts = self.options.clone();
-        opts.auth = AuthStyle::Token(token.to_string());
-        Connection {
-            state: Authenticated {},
-            options: opts,
-        }
-    }
-
-    /// Authenticate this NATS connection with a username and poassword.
-    ///
-    /// # Example
-    /// ```
-    /// # fn main() -> std::io::Result<()> {
-    /// let nc = nats::Connection::new()
-    ///     .with_user_pass("derek", "s3cr3t!")
-    ///     .connect("demo.nats.io")?;
-    /// # Ok(())
-    /// # }
-    /// ```
-    pub fn with_user_pass(self, user: &str, password: &str) -> Connection<Authenticated> {
-        let mut opts = self.options.clone();
-        opts.auth = AuthStyle::UserPass(user.to_string(), password.to_string());
-        Connection {
-            state: Authenticated {},
-            options: opts,
-        }
-    }
-
-    #[doc(hidden)]
-    pub fn connect(self, nats_url: &str) -> io::Result<Connection<Connected>> {
-        let conn = Connection {
-            state: Authenticated {},
-            options: self.options.clone(),
-        };
-        let conn = conn.connect(nats_url)?;
-        Ok(conn)
-    }
-}
-
-impl Connection<Authenticated> {
-    fn check_port(&self, nats_url: &str) -> String {
-        match nats_url.parse::<SocketAddr>() {
-            Ok(_) => nats_url.to_string(),
-            Err(_) => match nats_url.find(':') {
-                Some(_) => nats_url.to_string(),
-                None => format!("{}:4222", nats_url),
-            },
-        }
-    }
-
-    /// Connect an unconnected NATS connection.
-    ///
-    /// # Example
-    /// ```
-    /// # fn main() -> std::io::Result<()> {
-    /// let nc = nats::Connection::new().connect("demo.nats.io")?;
-    /// # Ok(())
-    /// # }
-    /// ```
-    pub fn connect(self, nats_url: &str) -> io::Result<Connection<Connected>> {
-        let connect_url = self.check_port(nats_url);
-        let stream = TcpStream::connect(connect_url)?;
-
-        let mut reader = BufReader::with_capacity(64 * 1024, stream.try_clone()?);
-        let server_info = parser::expect_info(&mut reader)?;
-
-        // TODO(dlc) - Fix, but for now at least signal properly.
-        if server_info.tls_required {
-            return Err(Error::new(
-                ErrorKind::ConnectionRefused,
-                "TLS currently not supported",
-            ));
-        }
-
-        let mut n = nuid::NUID::new();
-
-        let mut conn = Connection {
-            state: Connected {
-                id: n.next(),
-                status: ConnectionStatus::Connecting,
-                stream: stream.try_clone()?,
-                info: server_info,
-                sid: AtomicUsize::new(1),
-                subs: Arc::new(RwLock::new(HashMap::new())),
-                pongs: Arc::new(Mutex::new(VecDeque::new())),
-                writer: Arc::new(Mutex::new(Outbound {
-                    writer: BufWriter::with_capacity(64 * 1024, stream.try_clone()?),
-                    flusher: None,
-                    should_flush: true,
-                    in_flush: false,
-                    closed: false,
-                })),
-                reader: None,
-            },
-            options: self.options.clone(),
-        };
-        conn.send_connect(&mut reader)?;
-        conn.state.status = ConnectionStatus::Connected;
-
-        // Setup the state we will move to the readloop thread
-        let mut state = parser::ReadLoopState {
-            reader: reader,
-            writer: conn.state.writer.clone(),
-            subs: conn.state.subs.clone(),
-            pongs: conn.state.pongs.clone(),
-        };
-
-        let read_loop = thread::spawn(move || {
-            // FIXME(dlc) - Capture?
-            if let Err(_) = parser::read_loop(&mut state) {
-                return;
-            }
-        });
-        conn.state.reader = Some(read_loop);
-
-        let usec = Duration::new(0, 1_000);
-        let wait: [Duration; 5] = [10 * usec, 100 * usec, 500 * usec, 1000 * usec, 5000 * usec];
-        let wbuf = conn.state.writer.clone();
-
-        let flusher_loop = thread::spawn(move || loop {
-            thread::park();
-            let start_len = start_flush_cycle(&wbuf);
-            thread::yield_now();
-            let mut cur_len = wbuf.lock().unwrap().writer.buffer().len();
-            if cur_len != start_len {
-                for d in wait.iter() {
-                    thread::sleep(*d);
-                    {
-                        let w = wbuf.lock().unwrap();
-                        cur_len = w.writer.buffer().len();
-                        if cur_len == 0 || cur_len == start_len || w.closed {
-                            break;
-                        }
-                    }
-                }
-            }
-            let mut w = wbuf.lock().unwrap();
-            w.in_flush = false;
-            if cur_len > 0 {
-                if let Err(_) = w.writer.flush() {
-                    break;
-                }
-            }
-            if w.closed {
-                break;
-            }
-        });
-        conn.state.writer.lock().unwrap().flusher = Some(flusher_loop);
-
-        Ok(conn)
-    }
-}
-
-fn start_flush_cycle(wbuf: &Arc<Mutex<Outbound>>) -> usize {
-    let mut w = wbuf.lock().unwrap();
-    w.in_flush = true;
-    w.writer.buffer().len()
-}
-
-#[derive(Debug)]
+/// A `Message` that has been published to a NATS `Subject`.
+#[derive(Debug, Clone)]
 pub struct Message {
+    /// The NATS `Subject` that this `Message` has been published to.
     pub subject: String,
+    /// The optional reply `Subject` that may be used for sending
+    /// responses when using the request/reply pattern.
     pub reply: Option<String>,
+    /// The `Message` contents.
     pub data: Vec<u8>,
-    pub(crate) writer: Option<Arc<Mutex<Outbound>>>,
+    /// Client for publishing on the reply subject.
+    pub(crate) client: Client,
+    /// Optional headers associated with this `Message`.
+    pub headers: Option<Headers>,
 }
 
 impl Message {
+    pub(crate) fn from_async(msg: asynk::Message) -> Message {
+        Message {
+            subject: msg.subject,
+            reply: msg.reply,
+            data: msg.data,
+            client: msg.client,
+            headers: msg.headers,
+        }
+    }
+
     /// Respond to a request message.
     ///
     /// # Example
     /// ```
     /// # fn main() -> std::io::Result<()> {
     /// # let nc = nats::connect("demo.nats.io")?;
-    /// let sub = nc.subscribe("help.request")?.with_handler(move |m| {
+    /// nc.subscribe("help.request")?.with_handler(move |m| {
     ///     m.respond("ans=42")?; Ok(())
     /// });
     /// # Ok(())
     /// # }
     /// ```
     pub fn respond(&self, msg: impl AsRef<[u8]>) -> io::Result<()> {
-        if let Some(writer) = &self.writer {
-            if let Some(reply) = &self.reply {
-                writer.lock().unwrap().write_response(reply, msg.as_ref())?;
-            }
-        } else {
-            return Err(Error::new(
+        match self.reply.as_ref() {
+            None => Err(Error::new(
                 ErrorKind::InvalidInput,
-                "No reply subject available",
-            ));
+                "no reply subject available",
+            )),
+            Some(reply) => future::block_on(self.client.publish(reply, None, None, msg.as_ref())),
         }
-        Ok(())
     }
 }
 
 impl fmt::Display for Message {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         let mut body = format!("[{} bytes]", self.data.len());
-        if let Ok(str) = str::from_utf8(&self.data) {
+        if let Ok(str) = std::str::from_utf8(&self.data) {
             body = str.to_string();
         }
         if let Some(reply) = &self.reply {
@@ -426,222 +351,7 @@ impl fmt::Display for Message {
     }
 }
 
-#[derive(Clone, Debug)]
-pub struct Subscription {
-    sid: usize,
-    recv: Receiver<Message>,
-    subs: Arc<RwLock<HashMap<usize, Sender<Message>>>>,
-    writer: Arc<Mutex<Outbound>>,
-}
-
-impl Subscription {
-    /// Get the next message, or None if the subscription has been unsubscribed or the connection closed.
-    ///
-    /// # Example
-    /// ```
-    /// # fn main() -> std::io::Result<()> {
-    /// # let nc = nats::connect("demo.nats.io")?;
-    /// # let sub = nc.subscribe("foo")?;
-    /// # nc.publish("foo", "hello")?;
-    /// if let Some(msg) = sub.next() {}
-    /// # Ok(())
-    /// # }
-    /// ```
-    pub fn next(&self) -> Option<Message> {
-        self.recv.iter().next()
-    }
-
-    /// Try to get the next message, or None if no messages are present or if the subscription has been unsubscribed or the connection closed.
-    ///
-    /// # Example
-    /// ```
-    /// # fn main() -> std::io::Result<()> {
-    /// # let nc = nats::connect("demo.nats.io")?;
-    /// # let sub = nc.subscribe("foo")?;
-    /// if let Some(msg) = sub.try_next() {
-    ///   println!("Received {}", msg);
-    /// }
-    /// # Ok(())
-    /// # }
-    /// ```
-    pub fn try_next(&self) -> Option<Message> {
-        self.recv.try_iter().next()
-    }
-
-    /// Get the next message, or a timeout error if no messages are available for timout.
-    ///
-    /// # Example
-    /// ```
-    /// # fn main() -> std::io::Result<()> {
-    /// # let nc = nats::connect("demo.nats.io")?;
-    /// # let sub = nc.subscribe("foo")?;
-    /// if let Ok(msg) = sub.next_timeout(std::time::Duration::from_secs(1)) {}
-    /// # Ok(())
-    /// # }
-    /// ```
-    pub fn next_timeout(&self, timeout: Duration) -> Result<Message, RecvTimeoutError> {
-        self.recv.recv_timeout(timeout)
-    }
-
-    /// Returns a blocking message iterator. Same as calling `iter()`.
-    ///
-    /// # Example
-    /// ```rust,no_run
-    /// # fn main() -> std::io::Result<()> {
-    /// # let nc = nats::connect("demo.nats.io")?;
-    /// # let sub = nc.subscribe("foo")?;
-    /// for msg in sub.messages() {}
-    /// # Ok(())
-    /// # }
-    /// ```
-    pub fn messages(&self) -> impl Iterator<Item = Message> + '_ {
-        self.recv.iter()
-    }
-
-    /// Returns a blocking message iterator.
-    ///
-    /// # Example
-    /// ```rust,no_run
-    /// # fn main() -> std::io::Result<()> {
-    /// # let nc = nats::connect("demo.nats.io")?;
-    /// # let sub = nc.subscribe("foo")?;
-    /// for msg in sub.iter() {}
-    /// # Ok(())
-    /// # }
-    /// ```
-    pub fn iter(&self) -> impl Iterator<Item = Message> + '_ {
-        self.recv.iter()
-    }
-
-    /// Returns a non-blocking message iterator.
-    ///
-    /// # Example
-    /// ```
-    /// # fn main() -> std::io::Result<()> {
-    /// # let nc = nats::connect("demo.nats.io")?;
-    /// # let sub = nc.subscribe("foo")?;
-    /// for msg in sub.try_iter() {}
-    /// # Ok(())
-    /// # }
-    /// ```
-    pub fn try_iter(&self) -> impl Iterator<Item = Message> + '_ {
-        self.recv.try_iter()
-    }
-
-    /// Returns a blocking message iterator with a time deadline for blocking.
-    ///
-    /// # Example
-    /// ```
-    /// # fn main() -> std::io::Result<()> {
-    /// # let nc = nats::connect("demo.nats.io")?;
-    /// # let sub = nc.subscribe("foo")?;
-    /// for msg in sub.timeout_iter(std::time::Duration::from_secs(1)) {}
-    /// # Ok(())
-    /// # }
-    /// ```
-    pub fn timeout_iter(&self, timeout: Duration) -> impl Iterator<Item = Message> + '_ {
-        SubscriptionDeadlineIterator {
-            r: self.recv.clone(),
-            to: timeout,
-        }
-    }
-
-    /// Attach a closure to handle messages.
-    /// This closure will execute in a separate thread.
-    ///
-    /// # Example
-    /// ```
-    /// # fn main() -> std::io::Result<()> {
-    /// # let nc = nats::connect("demo.nats.io")?;
-    /// let sub = nc.subscribe("bar")?.with_handler(move |msg| {
-    ///     println!("Received {}", &msg);
-    ///     Ok(())
-    /// });
-    /// # Ok(())
-    /// # }
-    /// ```
-    pub fn with_handler<F>(self, handler: F) -> Self
-    where
-        F: Fn(Message) -> io::Result<()> + Sync + Send,
-        F: 'static,
-    {
-        let r = self.recv.clone();
-        thread::spawn(move || {
-            for m in r.iter() {
-                if let Err(e) = handler(m) {
-                    // TODO(dlc) - Capture for last error?
-                    println!("Error in callback! {:?}", e);
-                }
-            }
-        });
-        self
-    }
-
-    fn unsub(&self) -> io::Result<()> {
-        self.subs.write().unwrap().remove(&self.sid);
-        let w = &mut self.writer.lock().unwrap().writer;
-        write!(w, "UNSUB {}\r\n", self.sid)?;
-        w.flush()?;
-        Ok(())
-    }
-
-    /// Unsubscribe a subscription.
-    ///
-    /// # Example
-    /// ```
-    /// # fn main() -> std::io::Result<()> {
-    /// # let nc = nats::connect("demo.nats.io")?;
-    /// let sub = nc.subscribe("foo")?;
-    /// sub.unsubscribe()?;
-    /// # Ok(())
-    /// # }
-    /// ```
-    pub fn unsubscribe(self) -> io::Result<()> {
-        self.unsub()
-    }
-
-    /// Close a subscription. Same as `unsubscribe`
-    ///
-    /// # Example
-    /// ```
-    /// # fn main() -> std::io::Result<()> {
-    /// # let nc = nats::connect("demo.nats.io")?;
-    /// let sub = nc.subscribe("foo")?;
-    /// sub.close()?;
-    /// # Ok(())
-    /// # }
-    /// ```
-    pub fn close(self) -> io::Result<()> {
-        self.unsub()
-    }
-}
-
-impl Drop for Subscription {
-    fn drop(&mut self) {
-        match self.unsub() {
-            Ok(_) => {}
-            Err(_) => {}
-        }
-    }
-}
-
-#[doc(hidden)]
-pub struct SubscriptionDeadlineIterator {
-    r: Receiver<Message>,
-    to: Duration,
-}
-
-impl Iterator for SubscriptionDeadlineIterator {
-    type Item = Message;
-    fn next(&mut self) -> Option<Self::Item> {
-        match self.r.recv_timeout(self.to) {
-            Ok(m) => Some(m),
-            _ => None,
-        }
-    }
-}
-
-impl Connection<Connected> {
+impl Connection {
     /// Create a subscription for the given NATS connection.
     ///
     /// # Example
@@ -653,7 +363,7 @@ impl Connection<Connected> {
     /// # }
     /// ```
     pub fn subscribe(&self, subject: &str) -> io::Result<Subscription> {
-        self.do_subscribe(subject, None)
+        future::block_on(self.0.subscribe(subject)).map(|s| Subscription(Arc::new(s.into())))
     }
 
     /// Create a queue subscription for the given NATS connection.
@@ -667,59 +377,8 @@ impl Connection<Connected> {
     /// # }
     /// ```
     pub fn queue_subscribe(&self, subject: &str, queue: &str) -> io::Result<Subscription> {
-        self.do_subscribe(subject, Some(queue))
-    }
-
-    fn do_subscribe(&self, subject: &str, queue: Option<&str>) -> io::Result<Subscription> {
-        let sid = self.state.sid.fetch_add(1, Ordering::Relaxed);
-        {
-            let w = &mut self.state.writer.lock().unwrap();
-            match queue {
-                Some(q) => write!(w.writer, "SUB {} {} {}\r\n", subject, q, sid)?,
-                None => write!(w.writer, "SUB {} {}\r\n", subject, sid)?,
-            }
-            if w.should_flush && !w.in_flush {
-                w.kick_flusher();
-            }
-        }
-        let (s, r) = crossbeam_channel::unbounded();
-        {
-            let mut subs = self.state.subs.write().unwrap();
-            subs.insert(sid, s);
-        }
-        // TODO(dlc) - Should we do a flush and check errors?
-        Ok(Subscription {
-            sid: sid,
-            recv: r,
-            writer: self.state.writer.clone(),
-            subs: self.state.subs.clone(),
-        })
-    }
-
-    #[doc(hidden)]
-    pub fn batch(&self) {
-        self.state.writer.lock().unwrap().should_flush = false;
-    }
-
-    #[doc(hidden)]
-    pub fn unbatch(&self) {
-        self.state.writer.lock().unwrap().should_flush = true;
-    }
-
-    #[inline(always)]
-    fn write_pub_msg(&self, subj: &str, reply: Option<&str>, msgb: &[u8]) -> io::Result<()> {
-        let mut w = self.state.writer.lock().unwrap();
-        if let Some(reply) = reply {
-            write!(w.writer, "PUB {} {} {}\r\n", subj, reply, msgb.len())?;
-        } else {
-            write!(w.writer, "PUB {} {}\r\n", subj, msgb.len())?;
-        }
-        w.writer.write(msgb)?;
-        w.writer.write(b"\r\n")?;
-        if w.should_flush && !w.in_flush {
-            w.kick_flusher();
-        }
-        Ok(())
+        future::block_on(self.0.queue_subscribe(subject, queue))
+            .map(|s| Subscription(Arc::new(s.into())))
     }
 
     /// Publish a message on the given subject.
@@ -733,7 +392,7 @@ impl Connection<Connected> {
     /// # }
     /// ```
     pub fn publish(&self, subject: &str, msg: impl AsRef<[u8]>) -> io::Result<()> {
-        self.write_pub_msg(subject, None, msg.as_ref())
+        future::block_on(self.0.publish(subject, msg))
     }
 
     /// Publish a message on the given subject with a reply subject for responses.
@@ -754,7 +413,7 @@ impl Connection<Connected> {
         reply: &str,
         msg: impl AsRef<[u8]>,
     ) -> io::Result<()> {
-        self.write_pub_msg(subject, Some(reply), msg.as_ref())
+        future::block_on(self.0.publish_request(subject, reply, msg))
     }
 
     /// Create a new globally unique inbox which can be used for replies.
@@ -769,7 +428,7 @@ impl Connection<Connected> {
     /// # }
     /// ```
     pub fn new_inbox(&self) -> String {
-        format!("_INBOX.{}.{}", self.state.id, nuid::next())
+        self.0.new_inbox()
     }
 
     /// Publish a message on the given subject as a request and receive the response.
@@ -778,28 +437,23 @@ impl Connection<Connected> {
     /// ```
     /// # fn main() -> std::io::Result<()> {
     /// # let nc = nats::connect("demo.nats.io")?;
-    /// # let sub = nc.subscribe("foo")?.with_handler(move |m| { m.respond("ans=42")?; Ok(()) });
-    /// let resp = nc.request_timeout("foo", "Help me?", std::time::Duration::from_secs(2))?;
+    /// # nc.subscribe("foo")?.with_handler(move |m| { m.respond("ans=42")?; Ok(()) });
+    /// let resp = nc.request("foo", "Help me?")?;
     /// # Ok(())
     /// # }
     /// ```
     pub fn request(&self, subject: &str, msg: impl AsRef<[u8]>) -> io::Result<Message> {
-        let reply = self.new_inbox();
-        let sub = self.subscribe(&reply)?;
-        self.publish_request(subject, &reply, msg)?;
-        match sub.next() {
-            Some(msg) => Ok(msg),
-            None => Err(Error::new(ErrorKind::NotConnected, "No response")),
-        }
+        future::block_on(self.0.request(subject, msg)).map(Message::from_async)
     }
 
-    /// Publish a message on the given subject as a request and receive the response. This call will return after the timeout duration if no response is received.
+    /// Publish a message on the given subject as a request and receive the response.
+    /// This call will return after the timeout duration if no response is received.
     ///
     /// # Example
     /// ```
     /// # fn main() -> std::io::Result<()> {
     /// # let nc = nats::connect("demo.nats.io")?;
-    /// # let sub = nc.subscribe("foo")?.with_handler(move |m| { m.respond("ans=42")?; Ok(()) });
+    /// # nc.subscribe("foo")?.with_handler(move |m| { m.respond("ans=42")?; Ok(()) });
     /// let resp = nc.request_timeout("foo", "Help me?", std::time::Duration::from_secs(2))?;
     /// # Ok(())
     /// # }
@@ -810,13 +464,16 @@ impl Connection<Connected> {
         msg: impl AsRef<[u8]>,
         timeout: Duration,
     ) -> io::Result<Message> {
-        let reply = self.new_inbox();
-        let sub = self.subscribe(&reply)?;
-        self.publish_request(subject, &reply, msg)?;
-        match sub.next_timeout(timeout) {
-            Ok(msg) => Ok(msg),
-            Err(_) => Err(Error::new(ErrorKind::TimedOut, "No response")),
-        }
+        future::block_on(async {
+            self.0
+                .request(subject, msg)
+                .or(async {
+                    Timer::new(timeout).await;
+                    Err(ErrorKind::TimedOut.into())
+                })
+                .await
+                .map(Message::from_async)
+        })
     }
 
     /// Publish a message on the given subject as a request and allow multiple responses.
@@ -825,19 +482,20 @@ impl Connection<Connected> {
     /// ```
     /// # fn main() -> std::io::Result<()> {
     /// # let nc = nats::connect("demo.nats.io")?;
-    /// # let sub = nc.subscribe("foo")?.with_handler(move |m| { m.respond("ans=42")?; Ok(()) });
+    /// # nc.subscribe("foo")?.with_handler(move |m| { m.respond("ans=42")?; Ok(()) });
     /// for msg in nc.request_multi("foo", "Help")?.iter().take(1) {}
     /// # Ok(())
     /// # }
     /// ```
     pub fn request_multi(&self, subject: &str, msg: impl AsRef<[u8]>) -> io::Result<Subscription> {
-        let reply = self.new_inbox();
-        let sub = self.subscribe(&reply)?;
-        self.publish_request(subject, &reply, msg)?;
-        Ok(sub)
+        future::block_on(self.0.request_multi(subject, msg))
+            .map(|s| Subscription(Arc::new(s.into())))
     }
 
     /// Flush a NATS connection by sending a `PING` protocol and waiting for the responding `PONG`.
+    /// Will fail with `TimedOut` if the server does not respond with in 10 seconds.
+    /// Will fail with `NotConnected` if the server is not currently connected.
+    /// Will fail with `BrokenPipe` if the connection to the server is lost.
     ///
     /// # Example
     /// ```
@@ -848,164 +506,157 @@ impl Connection<Connected> {
     /// # }
     /// ```
     pub fn flush(&self) -> io::Result<()> {
-        // TODO(dlc) - bounded or oneshot?
-        self.unbatch();
-        let (s, r) = crossbeam_channel::unbounded();
-        {
-            let mut pongs = self.state.pongs.lock().unwrap();
-            pongs.push_back(s);
-        }
-        self.send_ping()?;
-        r.recv().unwrap();
-        Ok(())
+        future::block_on(self.0.flush())
     }
 
-    fn send_ping(&self) -> io::Result<()> {
-        let w = &mut self.state.writer.lock().unwrap().writer;
-        w.write(b"PING\r\n")?;
-        // Flush in place on pings.
-        w.flush()?;
-        Ok(())
-    }
-
-    /// Close a NATS connection.
+    /// Flush a NATS connection by sending a `PING` protocol and waiting for the responding `PONG`.
+    /// Will fail with `TimedOut` if the server takes longer than this duration to respond.
+    /// Will fail with `NotConnected` if the server is not currently connected.
+    /// Will fail with `BrokenPipe` if the connection to the server is lost.
     ///
     /// # Example
     /// ```
     /// # fn main() -> std::io::Result<()> {
     /// # let nc = nats::connect("demo.nats.io")?;
-    /// nc.close()?;
+    /// nc.flush()?;
     /// # Ok(())
     /// # }
     /// ```
-    pub fn close(self) -> io::Result<()> {
-        drop(self);
-        Ok(())
+    pub fn flush_timeout(&self, duration: Duration) -> io::Result<()> {
+        future::block_on(self.0.flush_timeout(duration))
     }
 
-    fn send_connect(&mut self, reader: &mut BufReader<TcpStream>) -> io::Result<()> {
-        let mut connect_op = Connect {
-            name: self.options.name.as_ref(),
-            pedantic: false,
-            verbose: false,
-            lang: LANG,
-            version: VERSION,
-            user: None,
-            pass: None,
-            auth_token: None,
-            echo: !self.options.no_echo,
-        };
-        match &self.options.auth {
-            AuthStyle::UserPass(user, pass) => {
-                connect_op.user = Some(user);
-                connect_op.pass = Some(pass);
-            }
-            AuthStyle::Token(token) => connect_op.auth_token = Some(token),
-            _ => {}
-        }
-        let op = format!(
-            "CONNECT {}\r\nPING\r\n",
-            serde_json::to_string(&connect_op)?
-        );
-        self.state.stream.write_all(op.as_bytes())?;
-
-        match parser::parse_control_op(reader)? {
-            parser::ControlOp::Pong => Ok(()),
-            parser::ControlOp::Err(e) => Err(Error::new(ErrorKind::ConnectionRefused, e)),
-            _ => Err(Error::new(ErrorKind::ConnectionRefused, "Protocol Error")),
-        }
+    /// Close a NATS connection. All clones of
+    /// this `Connection` will also be closed,
+    /// as the backing IO threads are shared.
+    ///
+    /// If the client is currently connected
+    /// to a server, the outbound write buffer
+    /// will be flushed in the process of
+    /// shutting down.
+    ///
+    /// # Example
+    /// ```
+    /// # fn main() -> std::io::Result<()> {
+    /// # let nc = nats::connect("demo.nats.io")?;
+    /// nc.close();
+    /// # Ok(())
+    /// # }
+    /// ```
+    pub fn close(self) {
+        let _ = future::block_on(self.0.close());
     }
-}
 
-impl Connected {
-    fn close(&mut self) -> io::Result<()> {
-        self.status = ConnectionStatus::Closed;
-        self.writer.lock().unwrap().closed = true;
-        let flusher = self.writer.lock().unwrap().flusher.take();
-        if let Some(ft) = flusher {
-            ft.thread().unpark();
-            if let Err(_) = ft.join() {}
-        }
-        // Shutdown socket.
-        self.stream.shutdown(Shutdown::Both)?;
-        if let Some(rt) = self.reader.take() {
-            if let Err(_) = rt.join() {}
-        }
-        Ok(())
+    /// Calculates the round trip time between this client and the server,
+    /// if the server is currently connected. Fails with `TimedOut` if
+    /// the server takes more than 10 seconds to respond.
+    ///
+    /// # Example
+    /// ```
+    /// # fn main() -> std::io::Result<()> {
+    /// # let nc = nats::connect("demo.nats.io")?;
+    /// println!("server rtt: {:?}", nc.rtt());
+    /// # Ok(())
+    /// # }
+    /// ```
+    pub fn rtt(&self) -> io::Result<Duration> {
+        future::block_on(self.0.rtt())
     }
-}
 
-impl Drop for Connected {
-    fn drop(&mut self) {
-        match self.close() {
-            _ => {}
-        }
+    /// Returns the client IP as known by the server.
+    /// Supported as of server version 2.1.6.
+    /// # Example
+    /// ```
+    /// # fn main() -> std::io::Result<()> {
+    /// # let nc = nats::connect("demo.nats.io")?;
+    /// println!("ip: {:?}", nc.client_ip());
+    /// # Ok(())
+    /// # }
+    /// ```
+    pub fn client_ip(&self) -> io::Result<std::net::IpAddr> {
+        self.0.client_ip()
     }
-}
 
-#[derive(Serialize, Debug)]
-struct Connect<'a> {
-    #[serde(skip_serializing_if = "empty_or_none")]
-    name: Option<&'a String>,
-    verbose: bool,
-    pedantic: bool,
-    #[serde(skip_serializing_if = "if_true")]
-    echo: bool,
-    lang: &'a str,
-    version: &'a str,
-
-    // Authentication
-    #[serde(skip_serializing_if = "empty_or_none")]
-    user: Option<&'a String>,
-    #[serde(skip_serializing_if = "empty_or_none")]
-    pass: Option<&'a String>,
-    #[serde(skip_serializing_if = "empty_or_none")]
-    auth_token: Option<&'a String>,
-}
-
-#[inline(always)]
-fn if_true(field: &bool) -> bool {
-    *field == true
-}
-
-#[inline(always)]
-fn empty_or_none(field: &Option<&String>) -> bool {
-    match field {
-        Some(_) => false,
-        None => true,
+    /// Returns the client ID as known by the most recently connected server.
+    ///
+    /// # Example
+    /// ```
+    /// # fn main() -> std::io::Result<()> {
+    /// # let nc = nats::connect("demo.nats.io")?;
+    /// println!("ip: {:?}", nc.client_id());
+    /// # Ok(())
+    /// # }
+    /// ```
+    pub fn client_id(&self) -> u64 {
+        self.0.client_id()
     }
-}
 
-#[derive(Deserialize, Debug)]
-struct ServerInfo {
-    server_id: String,
-    server_name: String,
-    host: String,
-    port: i16,
-    version: String,
-    #[serde(default = "default_false")]
-    auth_required: bool,
-    #[serde(default = "default_false")]
-    tls_required: bool,
-    max_payload: i32,
-    proto: i8,
-    client_id: u64,
-    go: String,
-    #[serde(default = "default_empty")]
-    nonce: String,
-    #[serde(default = "default_no_urls")]
-    connect_urls: Vec<String>,
-}
+    /// Send an unsubscription for all subs then flush the connection, allowing any unprocessed
+    /// messages to be handled by a handler function if one is configured.
+    ///
+    /// After the flush returns, we know that a round-trip to the server has happened after it
+    /// received our unsubscription, so we shut down the subscriber afterwards.
+    ///
+    /// A similar method exists for the `Subscription` struct which will drain
+    /// a single `Subscription` without shutting down the entire connection
+    /// afterward.
+    ///
+    /// # Example
+    /// ```
+    /// # use std::sync::{Arc, atomic::{AtomicBool, Ordering::SeqCst}};
+    /// # fn main() -> std::io::Result<()> {
+    /// # let nc = nats::connect("demo.nats.io")?;
+    /// let received = Arc::new(AtomicBool::new(false));
+    /// let received_2 = received.clone();
+    ///
+    /// nc.subscribe("test.drain")?.with_handler(move |m| {
+    ///     received_2.store(true, SeqCst);
+    ///     Ok(())
+    /// });
+    ///
+    /// nc.publish("test.drain", "message")?;
+    /// nc.drain()?;
+    ///
+    /// # std::thread::sleep(std::time::Duration::from_secs(1));
+    ///
+    /// assert!(received.load(SeqCst));
+    ///
+    /// # Ok(())
+    /// # }
+    /// ```
+    pub fn drain(&self) -> io::Result<()> {
+        future::block_on(self.0.drain())
+    }
 
-#[inline(always)]
-fn default_false() -> bool {
-    false
-}
-#[inline(always)]
-fn default_empty() -> String {
-    "".to_string()
-}
-#[inline(always)]
-fn default_no_urls() -> Vec<String> {
-    vec![]
+    /// Publish a message which may have a reply subject or headers set.
+    ///
+    /// # Example
+    /// ```no_run
+    /// # fn main() -> std::io::Result<()> {
+    /// # let nc = nats::connect("demo.nats.io")?;
+    /// let sub = nc.subscribe("foo.headers")?;
+    /// let headers = [("header1", "value1"),
+    ///                ("header2", "value2")].iter().collect();
+    /// let reply_to = None;
+    /// nc.publish_with_reply_or_headers("foo.headers", reply_to, Some(&headers), "Hello World!")?;
+    /// nc.flush()?;
+    /// let message = sub.next_timeout(std::time::Duration::from_secs(2)).unwrap();
+    /// assert_eq!(message.headers.unwrap().len(), 2);
+    /// # Ok(())
+    /// # }
+    /// ```
+    pub fn publish_with_reply_or_headers(
+        &self,
+        subject: &str,
+        reply: Option<&str>,
+        headers: Option<&Headers>,
+        msg: impl AsRef<[u8]>,
+    ) -> io::Result<()> {
+        future::block_on(self.0.publish_with_reply_or_headers(
+            subject,
+            reply,
+            headers,
+            msg.as_ref(),
+        ))
+    }
 }

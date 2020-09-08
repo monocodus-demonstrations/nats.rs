@@ -1,13 +1,22 @@
 use nats;
 use quicli::prelude::*;
-use structopt::StructOpt;
+use structopt::{clap::ArgGroup, StructOpt};
 
 /// NATS utility that can perform basic publish, subscribe, request and reply functions.
 #[derive(Debug, StructOpt)]
+#[structopt(group = ArgGroup::with_name("auth").required(false))]
 struct Cli {
     /// NATS server
     #[structopt(long, short, default_value = "demo.nats.io")]
     server: String,
+
+    /// User Credentials File
+    #[structopt(long = "creds", group = "auth")]
+    creds: Option<String>,
+    /// Server authorization token
+    #[structopt(long = "auth-token", group = "auth")]
+    auth_token: Option<String>,
+
     /// Command: pub, sub, request, reply
     #[structopt(subcommand)]
     cmd: Command,
@@ -28,12 +37,24 @@ enum Command {
 
 fn main() -> CliResult {
     let args = Cli::from_args();
-    let nc = nats::Connection::new()
+
+    let opts = if let Some(creds_path) = args.creds {
+        nats::Options::with_credentials(creds_path)
+    } else if let Some(token) = args.auth_token {
+        nats::Options::with_token(&token)
+    } else {
+        nats::Options::new()
+    };
+
+    let nc = opts
         .with_name("nats-box rust example")
         .connect(&args.server)?;
 
     match args.cmd {
-        Command::Pub { subject, msg } => nc.publish(&subject, msg)?,
+        Command::Pub { subject, msg } => {
+            nc.publish(&subject, &msg)?;
+            println!("Published to '{}': '{}'", subject, msg);
+        }
         Command::Sub { subject } => {
             let sub = nc.subscribe(&subject)?;
             println!("Listening on '{}'", subject);
@@ -43,7 +64,7 @@ fn main() -> CliResult {
         }
         Command::Request { subject, msg } => {
             println!("Waiting on response for '{}'", subject);
-            let resp = nc.request(&subject, msg)?;
+            let resp = nc.request(&subject, &msg)?;
             println!("Response is {}", resp);
         }
         Command::Reply { subject, resp } => {

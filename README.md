@@ -1,63 +1,72 @@
-# NATS - Rust Client (Beta, work in progress)
-A [Rust](https://www.rust-lang.org/) client for the [NATS messaging system](https://nats.io).
+<p align="center">
+  <img src="https://raw.githubusercontent.com/nats-io/nats.rs/master/logo/NATS-Rust.png">
+</p>
+
+<p align="center">
+    A <a href="https://www.rust-lang.org/">Rust</a> client for the <a href="https://nats.io">NATS messaging system</a>.
+</p>
+
+## Status
 
 [![License Apache 2](https://img.shields.io/badge/License-Apache2-blue.svg)](https://www.apache.org/licenses/LICENSE-2.0)
+[![Crates.io](https://img.shields.io/crates/v/nats.svg)](https://crates.io/crates/nats)
+[![Documentation](https://docs.rs/nats/badge.svg)](https://docs.rs/nats/)
+[![Build Status](https://github.com/nats-io/nats.rs/workflows/Rust/badge.svg)](https://github.com/nats-io/nats.rs/actions)
+
 
 ## Motivation
-Rust may be the most interesting new language the NATS ecosystem has seen. We believe this client will have a large impact on NATS, distributed systems, and embedded and IoT environments. With Rust we wanted to be as idiomatic as we could be and embrace the language. We moved many things that would have been runtime checks and errors to the compiler, most notably options on connections, and having subscriptions generate multiple styles of iterators, since iterators are a first class citizen in Rust. We also wanted to be aligned with the NATS philosophy of simple, secure, and fast! (The security is coming soon!)
+
+Rust may be the most interesting new language the NATS ecosystem has seen. We
+believe this client will have a large impact on NATS, distributed systems, and
+embedded and IoT environments. With Rust we wanted to be as idiomatic as we
+could be and lean into the strengths of the language. We moved many things that
+would have been runtime checks and errors to the compiler, most notably options
+on connections, and having subscriptions generate multiple styles of iterators,
+since iterators are a first class citizen in Rust. We also wanted to be aligned
+with the NATS philosophy of simple, secure, and fast!
 
 ## Feedback
 
-This is a new client, and I and the team are new to Rust, so all feedback welcome!
-We encourage all folks in the NATS and Rust ecosystems to help us improve this library. Please open issues, submit PRs, etc.
-
-## Installation
-
-Currently you need to build from source. We will place on crates.io soon.
-
-## Documentation
-
-```bash
-> cargo doc --open
-```
+We encourage all folks in the NATS and Rust ecosystems to help us
+improve this library. Please open issues, submit PRs, etc. We're
+available in the `rust` channel on [the NATS slack](https://slack.nats.io)
+as well!
 
 ## Example Usage
 
-`> cargo run --example nats-box -h`
+`> cargo run --example nats-box -- -h`
 
 Basic connections, and those with options. The compiler will force these to be correct.
 
 ```rust
-let nc = nats::connect("localhost")?;
+let nc = nats::connect("demo.nats.io")?;
 
-let nc2 = nats::Connection::new()
+let nc2 = nats::Options::with_user_pass("derek", "s3cr3t!")
     .with_name("My Rust NATS App")
-    .with_user_pass("derek", "s3cr3t!")
     .connect("127.0.0.1")?;
+
+let nc3 = nats::Options::with_credentials("path/to/my.creds")
+    .connect("connect.ngs.global")?;
+
+let nc4 = nats::Options::new()
+    .add_root_certificate("my-certs.pem")
+    .connect("tls://demo.nats.io:4443")?;
 ```
 
-Publish
+### Publish
 
 ```rust
-nc.publish("foo", "Hello World!")?;
+nc.publish("my.subject", "Hello World!")?;
 
-// Serde serialization.
-let p = Person {
-    first_name: "derek",
-    last_name: "collison",
-    age: 22,
-};
-
-let json = serde_json::to_vec(&p)?;
-nc.publish("foo", json)?;
+nc.publish("my.subject", "my message")?;
 
 // Publish a request manually.
 let reply = nc.new_inbox();
-let rsub = nc.subscribe(reply)?;
-nc.publish_request("foo", reply, "Help me!")?;
+let rsub = nc.subscribe(&reply)?;
+nc.publish_request("my.subject", &reply, "Help me!")?;
 ```
 
-Subscribe
+### Subscribe
 
 ```rust
 let sub = nc.subscribe("foo")?;
@@ -73,13 +82,14 @@ for msg in sub.timeout_iter(Duration::from_secs(10)) {}
 // Using a threaded handler.
 let sub = nc.subscribe("bar")?.with_handler(move |msg| {
     println!("Received {}", &msg);
-}
+    Ok(())
+});
 
 // Queue subscription.
 let qsub = nc.queue_subscribe("foo", "my_group")?;
 ```
 
-Request/Response
+### Request/Response
 
 ```rust
 let resp = nc.request("foo", "Help me?")?;
@@ -92,35 +102,42 @@ for msg in nc.request_multi("foo", "Help")?.iter() {}
 
 // Publish a request manually.
 let reply = nc.new_inbox();
-let rsub = nc.subscribe(reply)?;
-nc.publish_request("foo", reply, "Help me!")?;
+let rsub = nc.subscribe(&reply)?;
+nc.publish_request("foo", &reply, "Help me!")?;
 let response = rsub.iter().take(1);
 ```
 
+## Minimum Supported Rust Version (MSRV)
+
+The minimum supported Rust version is 1.40.0.
+
 ## Sync vs Async
 
-The Rust ecosystem has a diverse set of options for async behaviors. This client library can be used somewhat effectively already with async runtimes such as async-std and tokio. Going forward we look to provide an async client. Publish today is mostly non-blocking, so largest API change would be around subscriptions being streams vs iterators by default. Also been researching sinks and whether or not they make sense. Would probably be a config feature for async wnd options for most runtimes like async-std and tokio.
+The Rust ecosystem has a diverse set of options for async programming. This client library can be used with any async runtime out of the box, such as async-std and tokio.
+
+The sync interface provided by this library is implemented as just a thin wrapper around its async interface. Those two interface styles look very similar, and you're free to choose whichever works best for your application.
 
 ## Features
 The following is a list of features currently supported and planned for the near future.
 
 * [X] Basic Publish/Subscribe
 * [X] Request/Reply - Singelton and Streams
-* [ ] Authentication
+* [X] Authentication
   * [X] Token
   * [X] User/Password
-  * [ ] Nkeys
-  * [ ] User JWTs (NATS 2.0)
-* [ ] Reconnect logic
-* [ ] TLS support
-* [ ] Direct async support
-* [ ] Crates.io listing
+  * [X] Nkeys
+  * [X] User JWTs (NATS 2.0)
+* [X] Reconnect logic
+* [X] TLS support
+* [X] Direct async support
+* [X] Crates.io listing
+* [ ] Header Support
 
 ### Miscellaneous TODOs
 * [ ] Ping timer
 * [X] msg.respond
-* [ ] Drain mode
+* [X] Drain mode
 * [ ] COW for received messages
-* [ ] Sub w/ handler can't do iter()
-* [ ] Backup servers for option
-* [ ] Travis integration
+* [X] Sub w/ handler can't do iter()
+* [X] Backup servers for option
+* [X] Travis integration
